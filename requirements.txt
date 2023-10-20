@@ -1,0 +1,6 @@
+azure_storage==0.37.0
+colorama==0.4.6
+msgraph_sdk==1.0.0a14
+pdfminer==20191125
+timeout_decorator==0.5.0
+XlsxWriter==3.1.2
