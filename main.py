@@ -1,13 +1,13 @@
 import argparse
-import asyncio
 import re
 import platform
-from dataclasses import dataclass
-
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from scans import *
 
 
-def scanner(scan, psaudit, mcaudit, azaudit) -> dict:
+def scanner(scan, psaudit, mcaudit, azaudit, psaudit_lock, mcaudit_lock, azaudit_lock):
     """This function runs the command of the scan and returns the output
 
     Args:
@@ -19,19 +19,22 @@ def scanner(scan, psaudit, mcaudit, azaudit) -> dict:
     Returns:
             dict: Returns the output of the scan
     """
-    match scan["type"]:
-        case "ps":  # if its powershell command
-            output = psaudit.pwsh_run(scan["command"])
-        case "az":  # if its azure command
-            ### Runs the command and if it fails then it's not applicable and adds the reason in the comment key of the scan dict
-            try:
-                output = azaudit.az_run(scan["command"])
-            except Exception as e:
-                scan["comment"] = str(e)
-                output = None
-        case _:
-            raise Exception()
-    return output
+    try:
+        output = None
+        if scan["type"] == "ps":
+            with psaudit_lock:
+                output = psaudit.pwsh_run(scan["command"])
+        elif scan["type"] == "az":
+            with azaudit_lock:
+                try:
+                    output = azaudit.az_run(scan["command"])
+                except Exception as e:
+                    scan["comment"] = str(e)
+        else:
+            raise ValueError("Unsupported scan type")
+        return get_result(output, scan)
+    except Exception as e:
+        return {"id": scan["id"], "name": scan["name"], "status": "Error", "comment": str(e)}
 
 
 def get_result(output, scan, secure_score):
@@ -87,6 +90,10 @@ def get_result(output, scan, secure_score):
     return scan
 
 
+async def scanner_async(scan, psaudit, mcaudit, azaudit, loop, psaudit_lock, mcaudit_lock, azaudit_lock):
+    with ThreadPoolExecutor() as pool:
+        return await loop.run_in_executor(pool, scanner, scan, psaudit, mcaudit, azaudit, psaudit_lock, mcaudit_lock, azaudit_lock)
+
 async def main():
     args = parse_args()
     if args is None:
@@ -95,15 +102,12 @@ async def main():
     info("Starting AzureKitty, connecting... This may take some time. Be patient.")
 
     if not platform.machine() in ("AMD64", "x86_64"):
-        warning(
-            "Some check may not work on this architecture. AzureAD module requires Amd64 architecture. The check will still be run, but they will likely say that the module is not found."
-            )
+        warning("Some checks may not work on this architecture.")
 
     assert_handler = AssertHandler()
     sess_ps = SessionPS(args.debug)
     sess_az = SessionAZ(args.debug)
     sess_mc = SessionMC(args.debug)
-
     ### POWERSHELL ###
     if not assert_handler.handle_assert(
         True == sess_ps.create_session(),
@@ -138,30 +142,44 @@ async def main():
     psaudit = PSAudit(sess_ps, args.debug)
     mcaudit = MCAudit(sess_mc, args.debug)
 
-
     objects = ObjectParser(args.input, args.debug).parse()
-    for obj in objects:
-        obj["comment"] = ""
+    result_dict = {}
 
-    for scan in objects:
+    loop = asyncio.get_running_loop()
+    
+    psaudit_lock = threading.Lock()
+    mcaudit_lock = threading.Lock()
+    azaudit_lock = threading.Lock()
+
+    tasks = [scanner_async(scan, psaudit, mcaudit, azaudit, loop, psaudit_lock, mcaudit_lock, azaudit_lock) for scan in objects]
+    completed, pending = await asyncio.wait(tasks)
+
+    for task in completed:
         try:
-            output = scanner(scan, psaudit, mcaudit, azaudit)
+            result = task.result()
+            result_dict[result["id"]] = result
         except Exception as e:
-            if args.debug:
-                error(e)
-            scan["status"] = "Error"
-            output = ""
-        scan = get_result(output, scan, None)
+            printf(f"Error during scan: {e}")
+
+    if pending:
+        printf("Cleaning up pending tasks...")
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                printf("Cancelled a pending task.")
+            except Exception as e:
+                printf(f"Error during handling pending task: {e}")
 
     success(f"Fully scanned the Azure/Office365 configuration.")
 
-    if args.output:
-        cleaned_result = {
-            key: result[key] for key in ["id", "name", "status", "comment"]
-        }
-        ObjectSerializer(cleaned_result, args.output, args.debug).serialize()
-        success(f"Results written to {args.output}.")
+    for scan_id, scan in result_dict.items():
+        print_audit_element(scan["id"], scan["name"], scan["status"])
 
+    if args.output:
+        cleaned_results = [{key: scan[key] for key in ["id", "name", "status", "comment"]} for scan in result_dict.values()]
+        ObjectSerializer(cleaned_results, args.output, args.debug).serialize()
 
 if __name__ == "__main__":
     asyncio.run(main())
